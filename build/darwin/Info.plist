@@ -1,0 +1,29 @@
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+    <dict>
+        <key>CFBundlePackageType</key>
+        <string>APPL</string>
+        <key>CFBundleName</key>
+        <string>Ember</string>
+        <key>CFBundleDisplayName</key>
+        <string>Ember</string>
+        <key>CFBundleExecutable</key>
+        <string>ember</string>
+        <key>CFBundleIdentifier</key>
+        <string>io.dbxf.ember</string>
+        <key>CFBundleVersion</key>
+        <string>1.0.0</string>
+        <key>CFBundleGetInfoString</key>
+        <string>Codex account switching and warming from the macOS menu bar.</string>
+        <key>CFBundleShortVersionString</key>
+        <string>1.0.0</string>
+        <key>LSMinimumSystemVersion</key>
+        <string>10.13.0</string>
+        <key>LSUIElement</key>
+        <true/>
+        <key>NSHighResolutionCapable</key>
+        <string>true</string>
+        <key>NSHumanReadableCopyright</key>
+        <string>MIT</string>
+    </dict>
+</plist>
