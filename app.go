@@ -312,7 +312,7 @@ type menuEntry struct {
 }
 
 func buildMenuEntries(accounts []AccountView, active, lastError string) []menuEntry {
-	entries := make([]menuEntry, 0, 5+len(accounts)*2)
+	entries := make([]menuEntry, 0, 5+len(accounts)*3)
 	header := "No Codex accounts saved in ~/.codex/accounts"
 	if active != "" {
 		header = "Active account: " + active
@@ -331,8 +331,12 @@ func buildMenuEntries(accounts []AccountView, active, lastError string) []menuEn
 			Checked: account.Active,
 		})
 		if subtitle := buildAccountSubtitle(account.Account); subtitle != "" {
-			entries = append(entries, menuEntry{Title: "  " + subtitle, Tag: TagDetailsBase + i + 1})
+			entries = append(entries, menuEntry{Title: "  " + subtitle, Tag: TagDetailsBase + 2*i + 1})
 		}
+		entries = append(entries, menuEntry{
+			Title: "  " + formatWeeklyReset(account.Cache.Usage),
+			Tag:   TagDetailsBase + 2*i + 2,
+		})
 	}
 
 	if len(accounts) > 0 {
@@ -355,6 +359,13 @@ func formatWeeklyUsage(usage UsageSnapshot) string {
 		return "Weekly --"
 	}
 	return fmt.Sprintf("Weekly %.0f%% used", *usage.WeeklyUsedPct)
+}
+
+func formatWeeklyReset(usage UsageSnapshot) string {
+	if usage.WeeklyReset.IsZero() {
+		return "Weekly reset unavailable"
+	}
+	return "Weekly resets " + usage.WeeklyReset.Local().Format("Mon, Jan 2, 2006 at 15:04 MST")
 }
 
 func trimForMenu(value string) string {

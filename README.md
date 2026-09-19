@@ -7,6 +7,7 @@ Ember is a tiny native macOS menu bar app for switching between local Codex acco
 - manages saved `~/.codex/accounts/*.json` snapshots
 - switches the active local Codex account without symlink-based auth churn
 - shows the percentage of each account's weekly Codex allowance that has been used
+- shows each account's weekly reset date and time in your local timezone, or indicates when it is unavailable
 
 Ember persists the active `~/.codex/auth.json` back into its named snapshot before switching, then atomically copies the selected snapshot into place. This preserves refresh-token rotation without changing normal `codex login` or `codex logout` behavior.
 
