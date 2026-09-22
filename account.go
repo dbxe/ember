@@ -210,6 +210,11 @@ func (m *AccountManager) fetchUsageFromExec(account Account) (UsageSnapshot, err
 	}
 	defer os.RemoveAll(tempHome)
 	tempCodexDir := filepath.Join(tempHome, ".codex")
+	probeAuthPath := filepath.Join(tempCodexDir, "auth.json")
+	originalAuth, err := os.ReadFile(probeAuthPath)
+	if err != nil {
+		return UsageSnapshot{}, err
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -225,7 +230,7 @@ func (m *AccountManager) fetchUsageFromExec(account Account) (UsageSnapshot, err
 		"--",
 		"Reply with exactly OK and nothing else.",
 	)
-	cmd.Env = append(os.Environ(), "HOME="+tempHome)
+	cmd.Env = append(os.Environ(), "HOME="+tempHome, "CODEX_HOME="+tempCodexDir)
 	cmd.Dir = m.homeDir
 	cmd.Stdin = strings.NewReader("")
 
@@ -234,19 +239,20 @@ func (m *AccountManager) fetchUsageFromExec(account Account) (UsageSnapshot, err
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	if err := cmd.Run(); err != nil {
+	runErr := cmd.Run()
+	// Refresh-token rotation can succeed even if the request later fails.
+	if err := m.persistProbeAuth(account, originalAuth, probeAuthPath); err != nil {
+		return UsageSnapshot{}, fmt.Errorf("persist usage probe auth: %w", err)
+	}
+	if runErr != nil {
 		message := summarizeCodexMessage(stderr.String())
 		if message == "" {
 			message = summarizeCodexMessage(stdout.String())
 		}
 		if message == "" {
-			message = err.Error()
+			message = runErr.Error()
 		}
 		return UsageSnapshot{}, errors.New(message)
-	}
-
-	if fileExists(filepath.Join(tempCodexDir, "auth.json")) {
-		_ = copyFileAtomic(filepath.Join(tempCodexDir, "auth.json"), account.Path)
 	}
 
 	usage, err := parseUsageFromLatestSession(filepath.Join(tempCodexDir, "sessions"))
@@ -255,6 +261,51 @@ func (m *AccountManager) fetchUsageFromExec(account Account) (UsageSnapshot, err
 	}
 	usage.Source = "codex session rate_limits"
 	return usage, nil
+}
+
+func (m *AccountManager) persistProbeAuth(account Account, original []byte, path string) error {
+	renewed, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if bytes.Equal(original, renewed) {
+		return nil
+	}
+	var before, after AuthFile
+	if err := json.Unmarshal(original, &before); err != nil {
+		return err
+	}
+	if err := json.Unmarshal(renewed, &after); err != nil {
+		return err
+	}
+	if after.Tokens.AccountID == "" || after.Tokens.AccountID != before.Tokens.AccountID ||
+		after.Tokens.AccessToken == "" || after.Tokens.RefreshToken == "" {
+		return errors.New("usage probe returned invalid or different account credentials")
+	}
+	snapshot, err := os.ReadFile(account.Path)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(snapshot, original) {
+		return errors.New("saved credentials changed during usage probe; refresh again")
+	}
+	if strings.TrimSpace(readIfExists(m.currentPath)) == account.Name {
+		active, err := os.ReadFile(m.authPath)
+		if err != nil {
+			return err
+		}
+		// Ember's lock serializes its own switches and probes. Also check for
+		// a login or renewal by another Codex process while this probe ran.
+		if !bytes.Equal(active, original) {
+			return errors.New("active credentials changed during usage probe; refresh again")
+		}
+		// Update the active copy first so later persistence cannot restore the
+		// old refresh token, even if writing the snapshot fails.
+		if err := writeTextAtomic(m.authPath, string(renewed), 0o600); err != nil {
+			return err
+		}
+	}
+	return writeTextAtomic(account.Path, string(renewed), 0o600)
 }
 
 type sessionEvent struct {

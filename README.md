@@ -11,6 +11,8 @@ Ember is a tiny native macOS menu bar app for switching between local Codex acco
 
 Ember persists the active `~/.codex/auth.json` back into its named snapshot before switching, then atomically copies the selected snapshot into place. This preserves refresh-token rotation without changing normal `codex login` or `codex logout` behavior.
 
+Before each usage refresh, Ember also synchronizes the active credentials into their snapshot so it picks up logins renewed by Codex while Ember is running. If a fallback usage probe renews credentials for the active account, Ember updates both copies, including when the request fails after renewal.
+
 Weekly usage refreshes every ten minutes and can be refreshed manually from the menu. If the usage endpoint is unavailable for local snapshot credentials, Ember runs a minimal isolated Codex request and reads the weekly rate-limit data from that session.
 
 ## Add another account

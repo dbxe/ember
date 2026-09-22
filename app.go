@@ -183,6 +183,14 @@ func (a *App) syncAccounts(fetchUsage, forceUsage bool) error {
 	a.syncMu.Lock()
 	defer a.syncMu.Unlock()
 
+	// Codex can renew the active login while Ember is running. Read that
+	// renewal before loading the snapshots used by either refresh path.
+	if fetchUsage {
+		if err := a.manager.PersistCurrentAuth(); err != nil {
+			return fmt.Errorf("persist current auth before usage refresh: %w", err)
+		}
+	}
+
 	accounts, activeName, err := a.manager.ListAccounts()
 	if err != nil {
 		return err
