@@ -17,7 +17,6 @@ const (
 	AppBundleID = "io.dbxf.ember"
 
 	usageRefreshWindow = 10 * time.Minute
-	refreshInterval    = 10 * time.Minute
 )
 
 type PersistentState struct {
@@ -28,6 +27,7 @@ type AccountCache struct {
 	Identity           string        `json:"identity,omitempty"`
 	LastUsageFetchedAt time.Time     `json:"lastUsageFetchedAt,omitempty"`
 	Usage              UsageSnapshot `json:"usage"`
+	Warmup             WarmupState   `json:"warmup,omitempty"`
 }
 
 type AccountView struct {
@@ -41,12 +41,14 @@ type App struct {
 	syncMu      sync.Mutex
 	menuMu      sync.Mutex
 	manager     *AccountManager
+	now         func() time.Time
 	state       PersistentState
 	accounts    []AccountView
 	activeName  string
 	lastError   string
 	menuDirty   bool
 	stopCh      chan struct{}
+	refreshWake chan struct{}
 	stopOnce    sync.Once
 	backgrounds sync.WaitGroup
 }
@@ -54,10 +56,12 @@ type App struct {
 func NewApp() *App {
 	return &App{
 		manager: NewAccountManager(),
+		now:     time.Now,
 		state: PersistentState{
 			Accounts: map[string]*AccountCache{},
 		},
-		stopCh: make(chan struct{}),
+		stopCh:      make(chan struct{}),
+		refreshWake: make(chan struct{}, 1),
 	}
 }
 
@@ -142,12 +146,12 @@ func (a *App) switchToAccount(name string) error {
 func (a *App) refreshLoop() {
 	defer a.backgrounds.Done()
 
-	ticker := time.NewTicker(refreshInterval)
-	defer ticker.Stop()
+	timer := time.NewTimer(a.nextRefreshDelay())
+	defer timer.Stop()
 
 	for {
 		select {
-		case <-ticker.C:
+		case <-timer.C:
 			if err := a.refreshAccounts(false); err != nil {
 				a.setLastError(err)
 				fmt.Fprintf(os.Stderr, "refresh failed: %v\n", err)
@@ -155,10 +159,29 @@ func (a *App) refreshLoop() {
 				a.setLastError(nil)
 			}
 			a.rebuildMenu()
+		case <-a.refreshWake:
 		case <-a.stopCh:
 			return
 		}
+		timer.Reset(a.nextRefreshDelay())
 	}
+}
+
+func (a *App) nextRefreshDelay() time.Duration {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	now := a.now()
+	next := now.Add(usageRefreshWindow)
+	for _, cache := range a.state.Accounts {
+		due := cache.LastUsageFetchedAt.Add(usageRefreshWindow)
+		if due.Before(next) {
+			next = due
+		}
+		if check := cache.Warmup.NextCheckAt; !check.IsZero() && check.Before(next) {
+			next = check
+		}
+	}
+	return max(time.Second, next.Sub(now))
 }
 
 func (a *App) accountAt(index int) (AccountView, bool) {
@@ -196,7 +219,7 @@ func (a *App) syncAccounts(fetchUsage, forceUsage bool) error {
 		return err
 	}
 
-	now := time.Now()
+	now := a.now()
 	views := make([]AccountView, 0, len(accounts))
 	updatedCaches := make(map[string]*AccountCache, len(accounts))
 	for _, account := range accounts {
@@ -216,13 +239,45 @@ func (a *App) syncAccounts(fetchUsage, forceUsage bool) error {
 			cache = AccountCache{Identity: identity}
 		}
 
-		if fetchUsage && (forceUsage || cache.LastUsageFetchedAt.IsZero() || now.Sub(cache.LastUsageFetchedAt) >= usageRefreshWindow) {
+		if fetchUsage && (forceUsage || cache.LastUsageFetchedAt.IsZero() || now.Sub(cache.LastUsageFetchedAt) >= usageRefreshWindow || (!cache.Warmup.NextCheckAt.IsZero() && !now.Before(cache.Warmup.NextCheckAt))) {
 			usage, usageErr := a.manager.FetchUsage(account)
-			cache.LastUsageFetchedAt = now
+			cache.LastUsageFetchedAt = a.now()
 			if usageErr == nil {
 				cache.Usage = usage
+				if cache.Warmup.observe(usage, a.now()) {
+					cache.Warmup.begin(a.now())
+					// Record the attempt before starting inference, including across crashes.
+					a.mu.Lock()
+					saved := cache
+					a.state.Accounts[account.Name] = &saved
+					a.mu.Unlock()
+					if err := a.saveState(); err != nil {
+						return err
+					}
+					// A read-only fallback may have rotated this account's credentials.
+					fresh, err := a.manager.readAccount(account.Name, account.Path)
+					if err == nil {
+						err = a.manager.WarmAccount(fresh)
+					}
+					if err != nil {
+						cache.Warmup.fail(err.Error(), a.now())
+					} else {
+						cache.Warmup.Phase = "verifying"
+						fresh, err = a.manager.readAccount(account.Name, account.Path)
+						if err == nil {
+							if after, fetchErr := a.manager.FetchUsage(fresh); fetchErr == nil {
+								cache.Usage = after
+								cache.LastUsageFetchedAt = a.now()
+								cache.Warmup.observe(after, a.now())
+							}
+						}
+					}
+				}
 			} else {
 				cache.Usage = UsageSnapshot{Error: usageErr.Error()}
+				if !cache.Warmup.NextCheckAt.IsZero() {
+					cache.Warmup.NextCheckAt = a.now().Add(usageRefreshWindow)
+				}
 			}
 		}
 
@@ -241,6 +296,12 @@ func (a *App) syncAccounts(fetchUsage, forceUsage bool) error {
 	a.mu.Unlock()
 
 	a.updateStatusTitle()
+	if fetchUsage {
+		select {
+		case a.refreshWake <- struct{}{}:
+		default:
+		}
+	}
 	return a.saveState()
 }
 
@@ -339,12 +400,15 @@ func buildMenuEntries(accounts []AccountView, active, lastError string) []menuEn
 			Checked: account.Active,
 		})
 		if subtitle := buildAccountSubtitle(account.Account); subtitle != "" {
-			entries = append(entries, menuEntry{Title: "  " + subtitle, Tag: TagDetailsBase + 2*i + 1})
+			entries = append(entries, menuEntry{Title: "  " + subtitle, Tag: TagDetailsBase + 4*i + 1})
 		}
 		entries = append(entries, menuEntry{
 			Title: "  " + formatWeeklyReset(account.Cache.Usage),
-			Tag:   TagDetailsBase + 2*i + 2,
+			Tag:   TagDetailsBase + 4*i + 2,
 		})
+		if subtitle := account.Cache.Warmup.subtitle(); subtitle != "" {
+			entries = append(entries, menuEntry{Title: "  " + subtitle, Tag: TagDetailsBase + 4*i + 3})
+		}
 	}
 
 	if len(accounts) > 0 {

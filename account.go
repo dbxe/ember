@@ -27,12 +27,10 @@ const (
 )
 
 type AccountManager struct {
-	homeDir     string
 	codexDir    string
 	accountsDir string
 	authPath    string
 	currentPath string
-	configPath  string
 	cacheDir    string
 }
 
@@ -71,12 +69,10 @@ func NewAccountManager() *AccountManager {
 	homeDir, _ := os.UserHomeDir()
 	codexDir := filepath.Join(homeDir, ".codex")
 	return &AccountManager{
-		homeDir:     homeDir,
 		codexDir:    codexDir,
 		accountsDir: filepath.Join(codexDir, "accounts"),
 		authPath:    filepath.Join(codexDir, "auth.json"),
 		currentPath: filepath.Join(codexDir, "current"),
-		configPath:  filepath.Join(codexDir, "config.toml"),
 		cacheDir:    filepath.Join(homeDir, ".cache", "ember"),
 	}
 }
@@ -191,7 +187,7 @@ func (m *AccountManager) FetchUsage(account Account) (UsageSnapshot, error) {
 		}
 	}
 
-	if usage, err := m.fetchUsageFromExec(account); err == nil {
+	if usage, err := m.fetchUsageFromServer(account); err == nil {
 		return usage, nil
 	} else {
 		lastErr = err
@@ -203,64 +199,146 @@ func (m *AccountManager) FetchUsage(account Account) (UsageSnapshot, error) {
 	return UsageSnapshot{}, fmt.Errorf("weekly Codex usage unavailable: %w", lastErr)
 }
 
-func (m *AccountManager) fetchUsageFromExec(account Account) (UsageSnapshot, error) {
-	tempHome, err := m.prepareSandboxHome(account.Path)
-	if err != nil {
-		return UsageSnapshot{}, err
-	}
-	defer os.RemoveAll(tempHome)
-	tempCodexDir := filepath.Join(tempHome, ".codex")
-	probeAuthPath := filepath.Join(tempCodexDir, "auth.json")
-	originalAuth, err := os.ReadFile(probeAuthPath)
-	if err != nil {
-		return UsageSnapshot{}, err
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(
-		ctx,
-		codexCommandPath(),
-		"exec",
-		"--skip-git-repo-check",
-		"--sandbox", "read-only",
-		"--color", "never",
-		"--json",
-		"--",
-		"Reply with exactly OK and nothing else.",
-	)
-	cmd.Env = append(os.Environ(), "HOME="+tempHome, "CODEX_HOME="+tempCodexDir)
-	cmd.Dir = m.homeDir
-	cmd.Stdin = strings.NewReader("")
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	runErr := cmd.Run()
-	// Refresh-token rotation can succeed even if the request later fails.
-	if err := m.persistProbeAuth(account, originalAuth, probeAuthPath); err != nil {
-		return UsageSnapshot{}, fmt.Errorf("persist usage probe auth: %w", err)
-	}
-	if runErr != nil {
-		message := summarizeCodexMessage(stderr.String())
-		if message == "" {
-			message = summarizeCodexMessage(stdout.String())
+// WarmAccount performs exactly one small inference using only this account's
+// credentials. The caller verifies the reset countdown separately.
+func (m *AccountManager) WarmAccount(account Account) error {
+	return m.withProbeHome(account, func(root string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		replyPath := filepath.Join(root, "reply.txt")
+		cmd := exec.CommandContext(ctx, codexCommandPath(), "exec",
+			"--skip-git-repo-check", "--sandbox", "read-only", "--color", "never",
+			"--model", "gpt-6-luna", "-c", `model_reasoning_effort="low"`,
+			"--ephemeral", "--output-last-message", replyPath,
+			"--", "Briefly acknowledge this message. Reply with exactly OK. Do not use tools.")
+		cmd.Env = probeEnvironment(root)
+		cmd.Dir = root
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("Codex warming probe failed (%v): %s", err, summarizeCodexMessage(stderr.String()))
 		}
-		if message == "" {
-			message = runErr.Error()
+		reply, err := os.ReadFile(replyPath)
+		if err != nil || strings.TrimSpace(string(reply)) == "" {
+			return errors.New("Codex warming probe returned no acknowledgment")
 		}
-		return UsageSnapshot{}, errors.New(message)
-	}
+		return nil
+	})
+}
 
-	usage, err := parseUsageFromLatestSession(filepath.Join(tempCodexDir, "sessions"))
-	if err != nil {
-		return UsageSnapshot{}, err
+// The fallback reads rate limits without generating a model response. Usage
+// refreshes must not quietly warm an account or spend tokens themselves.
+func (m *AccountManager) fetchUsageFromServer(account Account) (usage UsageSnapshot, err error) {
+	err = m.withProbeHome(account, func(root string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, codexCommandPath(), "app-server", "--listen", "stdio://")
+		cmd.Env = probeEnvironment(root)
+		cmd.Dir = root
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			return err
+		}
+		defer stdin.Close()
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			return err
+		}
+		if err := cmd.Start(); err != nil {
+			return err
+		}
+		defer func() { cancel(); _ = cmd.Wait() }()
+		encoder := json.NewEncoder(stdin)
+		send := func(id int, method string, params any) error {
+			return encoder.Encode(map[string]any{"id": id, "method": method, "params": params})
+		}
+		if err := send(1, "initialize", map[string]any{"clientInfo": map[string]string{"name": "ember", "version": "1.0"}}); err != nil {
+			return err
+		}
+		scanner := bufio.NewScanner(stdout)
+		scanner.Buffer(make([]byte, 4096), 1024*1024)
+		for scanner.Scan() {
+			var response struct {
+				ID     int             `json:"id"`
+				Result json.RawMessage `json:"result"`
+				Error  *struct {
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if json.Unmarshal(scanner.Bytes(), &response) != nil || response.ID == 0 {
+				continue
+			}
+			if response.Error != nil {
+				return errors.New(response.Error.Message)
+			}
+			if response.ID == 1 {
+				if err := encoder.Encode(map[string]string{"method": "initialized"}); err != nil {
+					return err
+				}
+				if err := send(2, "account/rateLimits/read", nil); err != nil {
+					return err
+				}
+			}
+			if response.ID == 2 {
+				var result struct {
+					RateLimits json.RawMessage            `json:"rateLimits"`
+					ByID       map[string]json.RawMessage `json:"rateLimitsByLimitId"`
+				}
+				if err := json.Unmarshal(response.Result, &result); err != nil {
+					return err
+				}
+				raw := result.RateLimits
+				if codex, ok := result.ByID["codex"]; ok {
+					raw = codex
+				}
+				var err error
+				usage, err = parseUsageFromRateLimits(raw)
+				usage.Source = "codex account/rateLimits/read"
+				return err
+			}
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err := scanner.Err(); err != nil {
+			return err
+		}
+		return errors.New("Codex exited without returning rate limits")
+	})
+	return usage, err
+}
+
+func probeEnvironment(root string) []string {
+	env := make([]string, 0, len(os.Environ())+2)
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		switch key {
+		case "HOME", "CODEX_HOME", "OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL":
+			continue
+		}
+		env = append(env, entry)
 	}
-	usage.Source = "codex session rate_limits"
-	return usage, nil
+	return append(env, "HOME="+root, "CODEX_HOME="+filepath.Join(root, ".codex"))
+}
+
+func (m *AccountManager) withProbeHome(account Account, run func(string) error) error {
+	root, err := m.prepareSandboxHome(account.Path)
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(root)
+	authPath := filepath.Join(root, ".codex", "auth.json")
+	original, err := os.ReadFile(authPath)
+	if err != nil {
+		return err
+	}
+	runErr := run(root)
+	// Rotation may succeed even when the subsequent request fails.
+	persistErr := m.persistProbeAuth(account, original, authPath)
+	return errors.Join(runErr, persistErr)
 }
 
 func (m *AccountManager) persistProbeAuth(account Account, original []byte, path string) error {
@@ -306,14 +384,6 @@ func (m *AccountManager) persistProbeAuth(account Account, original []byte, path
 		}
 	}
 	return writeTextAtomic(account.Path, string(renewed), 0o600)
-}
-
-type sessionEvent struct {
-	Type    string `json:"type"`
-	Payload struct {
-		Type       string          `json:"type"`
-		RateLimits json.RawMessage `json:"rate_limits"`
-	} `json:"payload"`
 }
 
 func (m *AccountManager) readAccount(name, path string) (Account, error) {
@@ -461,77 +531,13 @@ func usageFromWindow(window map[string]any) (UsageSnapshot, bool) {
 }
 
 func windowDurationMinutes(window map[string]any) int {
-	if minutes := firstFloat(window["window_minutes"], window["windowMinutes"]); minutes != nil {
+	if minutes := firstFloat(window["window_minutes"], window["windowMinutes"], window["windowDurationMins"]); minutes != nil {
 		return int(*minutes)
 	}
 	if seconds := firstFloat(window["window_seconds"], window["windowSeconds"], window["limit_window_seconds"]); seconds != nil {
 		return int(*seconds / 60)
 	}
 	return 0
-}
-
-func parseUsageFromLatestSession(root string) (UsageSnapshot, error) {
-	sessionPath, err := latestFileUnder(root)
-	if err != nil {
-		return UsageSnapshot{}, err
-	}
-
-	file, err := os.Open(sessionPath)
-	if err != nil {
-		return UsageSnapshot{}, err
-	}
-	defer file.Close()
-
-	var latest UsageSnapshot
-	found := false
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		var event sessionEvent
-		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
-			continue
-		}
-		if event.Type != "event_msg" || event.Payload.Type != "token_count" || len(event.Payload.RateLimits) == 0 {
-			continue
-		}
-		usage, err := parseUsageFromRateLimits(event.Payload.RateLimits)
-		if err != nil {
-			continue
-		}
-		latest = usage
-		found = true
-	}
-	if err := scanner.Err(); err != nil {
-		return UsageSnapshot{}, err
-	}
-	if !found {
-		return UsageSnapshot{}, errors.New("weekly rate_limits not found in Codex session")
-	}
-	return latest, nil
-}
-
-func latestFileUnder(root string) (string, error) {
-	var latestPath string
-	var latestMod time.Time
-	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if info.IsDir() || !strings.HasSuffix(path, ".jsonl") {
-			return nil
-		}
-		if latestPath == "" || info.ModTime().After(latestMod) {
-			latestPath = path
-			latestMod = info.ModTime()
-		}
-		return nil
-	})
-	if err != nil {
-		return "", err
-	}
-	if latestPath == "" {
-		return "", errors.New("no Codex session log found")
-	}
-	return latestPath, nil
 }
 
 func parseUsageFromRateLimits(raw json.RawMessage) (UsageSnapshot, error) {
@@ -701,8 +707,10 @@ func (m *AccountManager) prepareSandboxHome(authSrc string) (string, error) {
 		os.RemoveAll(root)
 		return "", err
 	}
-	if fileExists(m.configPath) {
-		_ = copyFileAtomic(m.configPath, filepath.Join(codexDir, "config.toml"))
+	// Do not inherit user models, instructions, MCP servers, or hooks.
+	if err := writeTextAtomic(filepath.Join(codexDir, "config.toml"), "cli_auth_credentials_store = \"file\"\n", 0o600); err != nil {
+		os.RemoveAll(root)
+		return "", err
 	}
 	return root, nil
 }

@@ -106,7 +106,7 @@ func TestUsageRefreshPicksUpActiveCredentialRenewal(t *testing.T) {
 	}
 }
 
-func TestUsageProbePreservesRenewal(t *testing.T) {
+func TestWarmProbePreservesRenewal(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		account    string
@@ -128,8 +128,10 @@ func TestUsageProbePreservesRenewal(t *testing.T) {
 			t.Setenv("EMBER_TEST_RENEWAL", renewalPath)
 			script := `test "$CODEX_HOME" = "$HOME/.codex"
 cp "$EMBER_TEST_RENEWAL" "$CODEX_HOME/auth.json"
-mkdir -p "$CODEX_HOME/sessions"
-printf '%s\n' '{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":54,"window_minutes":10080,"resets_at":1790428295}}}}' > "$CODEX_HOME/sessions/probe.jsonl"
+while [ "$#" -gt 0 ]; do
+ if [ "$1" = "--output-last-message" ]; then shift; printf 'OK\n' > "$1"; break; fi
+ shift
+done
 `
 			if tc.requestErr {
 				script += "echo 'request failed after renewal' >&2\nexit 1\n"
@@ -139,13 +141,13 @@ printf '%s\n' '{"type":"event_msg","payload":{"type":"token_count","rate_limits"
 			if err != nil {
 				t.Fatal(err)
 			}
-			usage, err := m.fetchUsageFromExec(account)
+			err = m.WarmAccount(account)
 			if tc.requestErr {
 				if err == nil || !strings.Contains(err.Error(), "request failed after renewal") {
 					t.Fatalf("probe error = %v", err)
 				}
-			} else if err != nil || usage.WeeklyUsedPct == nil || *usage.WeeklyUsedPct != 54 {
-				t.Fatalf("probe usage = %+v, error = %v", usage, err)
+			} else if err != nil {
+				t.Fatalf("probe error = %v", err)
 			}
 			assertFileContents(t, account.Path, renewed)
 			if tc.account == "work" {
