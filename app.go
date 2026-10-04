@@ -70,6 +70,7 @@ func (a *App) Start() {
 		fmt.Fprintf(os.Stderr, "failed to load Ember state: %v\n", err)
 	}
 	if err := a.manager.PersistCurrentAuth(); err != nil {
+		a.setLastError(err)
 		fmt.Fprintf(os.Stderr, "failed to persist current auth: %v\n", err)
 	}
 
@@ -208,9 +209,11 @@ func (a *App) syncAccounts(fetchUsage, forceUsage bool) error {
 
 	// Codex can renew the active login while Ember is running. Read that
 	// renewal before loading the snapshots used by either refresh path.
+	var syncErr error
 	if fetchUsage {
 		if err := a.manager.PersistCurrentAuth(); err != nil {
-			return fmt.Errorf("persist current auth before usage refresh: %w", err)
+			syncErr = fmt.Errorf("persist current auth before usage refresh: %w", err)
+			fetchUsage = false
 		}
 	}
 
@@ -218,6 +221,23 @@ func (a *App) syncAccounts(fetchUsage, forceUsage bool) error {
 	if err != nil {
 		return err
 	}
+	// The marker may be stale after a login outside Ember. Do not put a
+	// checkmark on credentials that are no longer the active login.
+	if activeName != "" {
+		active, err := a.manager.readAccount(activeName, a.manager.authPath)
+		verified := false
+		if err == nil {
+			for _, account := range accounts {
+				if account.Name == activeName && account.identity() == active.identity() {
+					verified = true
+				}
+			}
+		}
+		if !verified {
+			activeName = ""
+		}
+	}
+	owners := loginOwners(accounts, activeName)
 
 	now := a.now()
 	views := make([]AccountView, 0, len(accounts))
@@ -231,15 +251,21 @@ func (a *App) syncAccounts(fetchUsage, forceUsage bool) error {
 		}
 		a.mu.RUnlock()
 
-		identity := account.AccountID
-		if identity == "" {
-			identity = account.Email
-		}
+		identity := account.identity()
 		if cache.Identity != identity {
 			cache = AccountCache{Identity: identity}
 		}
+		if syncErr != nil {
+			cache.LastUsageFetchedAt = now
+			if !cache.Warmup.NextCheckAt.IsZero() {
+				cache.Warmup.NextCheckAt = now.Add(usageRefreshWindow)
+			}
+		}
 
-		if fetchUsage && (forceUsage || cache.LastUsageFetchedAt.IsZero() || now.Sub(cache.LastUsageFetchedAt) >= usageRefreshWindow || (!cache.Warmup.NextCheckAt.IsZero() && !now.Before(cache.Warmup.NextCheckAt))) {
+		if owner := owners[identity]; identity != "" && owner != account.Name {
+			// Aliases share one allowance. Only its owner can fetch or warm it.
+			cache = AccountCache{Identity: identity, LastUsageFetchedAt: now}
+		} else if fetchUsage && (forceUsage || cache.LastUsageFetchedAt.IsZero() || now.Sub(cache.LastUsageFetchedAt) >= usageRefreshWindow || (!cache.Warmup.NextCheckAt.IsZero() && !now.Before(cache.Warmup.NextCheckAt))) {
 			usage, usageErr := a.manager.FetchUsage(account)
 			cache.LastUsageFetchedAt = a.now()
 			if usageErr == nil {
@@ -302,7 +328,18 @@ func (a *App) syncAccounts(fetchUsage, forceUsage bool) error {
 		default:
 		}
 	}
-	return a.saveState()
+	return errors.Join(syncErr, a.saveState())
+}
+
+func loginOwners(accounts []Account, active string) map[string]string {
+	owners := make(map[string]string)
+	for _, account := range accounts {
+		identity := account.identity()
+		if identity != "" && (owners[identity] == "" || account.Name == active) {
+			owners[identity] = account.Name
+		}
+	}
+	return owners
 }
 
 func (a *App) setLastError(err error) {
@@ -383,6 +420,9 @@ type menuEntry struct {
 func buildMenuEntries(accounts []AccountView, active, lastError string) []menuEntry {
 	entries := make([]menuEntry, 0, 5+len(accounts)*3)
 	header := "No Codex accounts saved in ~/.codex/accounts"
+	if len(accounts) > 0 {
+		header = "Active account: unknown"
+	}
 	if active != "" {
 		header = "Active account: " + active
 	}
@@ -392,15 +432,33 @@ func buildMenuEntries(accounts []AccountView, active, lastError string) []menuEn
 	}
 	entries = append(entries, menuEntry{Separator: true})
 
+	logins := make([]Account, 0, len(accounts))
+	for _, view := range accounts {
+		logins = append(logins, view.Account)
+	}
+	owners := loginOwners(logins, active)
 	for i, account := range accounts {
+		owner := owners[account.Account.identity()]
+		duplicate := owner != "" && owner != account.Account.Name
+		usageTitle := formatWeeklyUsage(account.Cache.Usage)
+		if duplicate {
+			usageTitle = "Same login as " + owner
+		}
 		entries = append(entries, menuEntry{
-			Title:   fmt.Sprintf("%s    %s", account.Account.Name, formatWeeklyUsage(account.Cache.Usage)),
+			Title:   fmt.Sprintf("%s    %s", account.Account.Name, usageTitle),
 			Tag:     TagAccountBase + i,
 			Enabled: true,
 			Checked: account.Active,
 		})
 		if subtitle := buildAccountSubtitle(account.Account); subtitle != "" {
 			entries = append(entries, menuEntry{Title: "  " + subtitle, Tag: TagDetailsBase + 4*i + 1})
+		}
+		if duplicate {
+			entries = append(entries, menuEntry{
+				Title: "  Reauthenticate " + account.Account.Name + " to restore its login",
+				Tag:   TagDetailsBase + 4*i + 2,
+			})
+			continue
 		}
 		entries = append(entries, menuEntry{
 			Title: "  " + formatWeeklyReset(account.Cache.Usage),

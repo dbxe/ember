@@ -122,13 +122,13 @@ func TestSwitchToAccountPersistsCurrentAuthAndActivatesTarget(t *testing.T) {
 	mainSnapshot := filepath.Join(accountsDir, "main.json")
 	workSnapshot := filepath.Join(accountsDir, "work.json")
 	authPath := filepath.Join(codexDir, "auth.json")
-	if err := os.WriteFile(mainSnapshot, []byte("main-old"), 0o600); err != nil {
+	if err := os.WriteFile(mainSnapshot, []byte(testAuth("main", "main-old")), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(workSnapshot, []byte("work-auth"), 0o600); err != nil {
+	if err := os.WriteFile(workSnapshot, []byte(testAuth("work", "work-auth")), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(authPath, []byte("main-refreshed"), 0o600); err != nil {
+	if err := os.WriteFile(authPath, []byte(testAuth("main", "main-refreshed")), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(codexDir, "current"), []byte("main\n"), 0o600); err != nil {
@@ -145,8 +145,8 @@ func TestSwitchToAccountPersistsCurrentAuthAndActivatesTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	assertFileContents(t, mainSnapshot, "main-refreshed")
-	assertFileContents(t, authPath, "work-auth")
+	assertFileContents(t, mainSnapshot, testAuth("main", "main-refreshed"))
+	assertFileContents(t, authPath, testAuth("work", "work-auth"))
 	assertFileContents(t, manager.currentPath, "work\n")
 }
 
@@ -159,7 +159,7 @@ func TestPersistCurrentAuthBootstrapsFirstSnapshot(t *testing.T) {
 	}
 	authPath := filepath.Join(codexDir, "auth.json")
 	currentPath := filepath.Join(codexDir, "current")
-	if err := os.WriteFile(authPath, []byte("current-auth"), 0o600); err != nil {
+	if err := os.WriteFile(authPath, []byte(testAuth("main", "current-auth")), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(currentPath, []byte("main\n"), 0o600); err != nil {
@@ -174,7 +174,7 @@ func TestPersistCurrentAuthBootstrapsFirstSnapshot(t *testing.T) {
 	if err := manager.PersistCurrentAuth(); err != nil {
 		t.Fatal(err)
 	}
-	assertFileContents(t, filepath.Join(accountsDir, "main.json"), "current-auth")
+	assertFileContents(t, filepath.Join(accountsDir, "main.json"), testAuth("main", "current-auth"))
 }
 
 func assertFileContents(t *testing.T, path, want string) {

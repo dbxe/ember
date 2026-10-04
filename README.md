@@ -14,6 +14,8 @@ Ember persists the active `~/.codex/auth.json` back into its named snapshot befo
 
 Before each usage refresh, Ember also synchronizes the active credentials into their snapshot so it picks up logins renewed by Codex while Ember is running. If a Codex usage read or warming probe renews credentials for the active account, Ember updates both copies, including when the request fails after renewal.
 
+Ember verifies both account and user identity before saving credentials. If a login outside Ember no longer matches the current account marker, it preserves the saved snapshot and reports the mismatch. Account switches and credential persistence coordinate with external Ember helpers through a shared file lock. If multiple names contain the same login, the menu labels the duplicate and only checks or warms that login once; the names do not represent separate allowances. Reauthenticate the duplicate name to restore its intended login.
+
 Weekly usage refreshes every ten minutes and can be refreshed manually from the menu. If the usage endpoint is unavailable for local snapshot credentials, Ember reads rate limits through an isolated Codex app server. Usage checks do not generate model responses.
 
 After a weekly reset, an unused account can show 0% usage with a reset time that keeps moving exactly seven days ahead. Ember checks again after 90 seconds to confirm that the reset is moving, then sends one small acknowledgment request to `gpt-6-luna`. It checks the reset again after at least 90 seconds and confirms warming only when the timestamp stays fixed and starts counting down. Accounts already counting down are left alone, even when usage still rounds to 0%.

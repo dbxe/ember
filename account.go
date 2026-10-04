@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -42,6 +43,7 @@ type Account struct {
 	Provider    string
 	Plan        string
 	AccountID   string
+	UserID      string
 	Auth        AuthFile
 }
 
@@ -109,13 +111,17 @@ func (m *AccountManager) ListAccounts() ([]Account, string, error) {
 }
 
 func (m *AccountManager) SwitchToAccount(name string) error {
+	return m.withAccountLock(func() error { return m.switchToAccount(name) })
+}
+
+func (m *AccountManager) switchToAccount(name string) error {
 	if !validAccountName(name) {
 		return errors.New("invalid account name")
 	}
 
 	currentName := strings.TrimSpace(readIfExists(m.currentPath))
 	if currentName != "" && currentName != name {
-		if err := m.PersistCurrentAuth(); err != nil {
+		if err := m.persistCurrentAuth(); err != nil {
 			return fmt.Errorf("persist current auth: %w", err)
 		}
 	}
@@ -123,6 +129,9 @@ func (m *AccountManager) SwitchToAccount(name string) error {
 	targetPath := filepath.Join(m.accountsDir, name+".json")
 	if !fileExists(targetPath) {
 		return fmt.Errorf("account %q not found", name)
+	}
+	if _, err := m.readAccount(name, targetPath); err != nil {
+		return fmt.Errorf("read target login: %w", err)
 	}
 	if err := os.MkdirAll(m.codexDir, 0o755); err != nil {
 		return err
@@ -134,6 +143,29 @@ func (m *AccountManager) SwitchToAccount(name string) error {
 }
 
 func (m *AccountManager) PersistCurrentAuth() error {
+	return m.withAccountLock(m.persistCurrentAuth)
+}
+
+// Coordinate writes with external Ember account-switch helpers as well as
+// other app instances. Locks are held only for credential file operations.
+func (m *AccountManager) withAccountLock(run func() error) error {
+	dir := filepath.Dir(m.authPath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	lock, err := os.OpenFile(filepath.Join(dir, ".ember-account-switch.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	return run()
+}
+
+func (m *AccountManager) persistCurrentAuth() error {
 	currentName := strings.TrimSpace(readIfExists(m.currentPath))
 	if currentName == "" {
 		return nil
@@ -145,7 +177,36 @@ func (m *AccountManager) PersistCurrentAuth() error {
 	if !fileExists(m.authPath) {
 		return nil
 	}
-	return copyFileAtomic(m.authPath, currentSnapshotPath)
+	data, err := os.ReadFile(m.authPath)
+	if err != nil {
+		return err
+	}
+	active, err := parseAccount(currentName, m.authPath, data)
+	if err != nil {
+		return fmt.Errorf("read active login: %w", err)
+	}
+	if fileExists(currentSnapshotPath) {
+		saved, err := m.readAccount(currentName, currentSnapshotPath)
+		if err != nil {
+			return fmt.Errorf("read saved login: %w", err)
+		}
+		if saved.identity() != active.identity() {
+			return fmt.Errorf("active login differs from %s; saved login preserved", currentName)
+		}
+	}
+	// Write the bytes whose identity was checked, rather than reopening auth
+	// after a concurrent Codex login may have replaced it.
+	return writeTextAtomic(currentSnapshotPath, string(data), 0o600)
+}
+
+// Organization IDs can be shared by different users. Compare both stable IDs,
+// rather than session tokens, which legitimately change during renewal.
+func (account Account) identity() string {
+	if account.AccountID == "" {
+		return ""
+	}
+	key, _ := json.Marshal([]string{account.AccountID, account.UserID})
+	return string(key)
 }
 
 func validAccountName(name string) bool {
@@ -342,6 +403,10 @@ func (m *AccountManager) withProbeHome(account Account, run func(string) error) 
 }
 
 func (m *AccountManager) persistProbeAuth(account Account, original []byte, path string) error {
+	return m.withAccountLock(func() error { return m.persistProbeAuthLocked(account, original, path) })
+}
+
+func (m *AccountManager) persistProbeAuthLocked(account Account, original []byte, path string) error {
 	renewed, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -356,7 +421,9 @@ func (m *AccountManager) persistProbeAuth(account Account, original []byte, path
 	if err := json.Unmarshal(renewed, &after); err != nil {
 		return err
 	}
-	if after.Tokens.AccountID == "" || after.Tokens.AccountID != before.Tokens.AccountID ||
+	beforeAccount := accountFromAuth("", "", before)
+	afterAccount := accountFromAuth("", "", after)
+	if afterAccount.identity() == "" || afterAccount.identity() != beforeAccount.identity() ||
 		after.Tokens.AccessToken == "" || after.Tokens.RefreshToken == "" {
 		return errors.New("usage probe returned invalid or different account credentials")
 	}
@@ -391,12 +458,23 @@ func (m *AccountManager) readAccount(name, path string) (Account, error) {
 	if err != nil {
 		return Account{}, err
 	}
+	return parseAccount(name, path, data)
+}
 
+func parseAccount(name, path string, data []byte) (Account, error) {
 	var auth AuthFile
 	if err := json.Unmarshal(data, &auth); err != nil {
 		return Account{}, err
 	}
 
+	account := accountFromAuth(name, path, auth)
+	if account.identity() == "" || auth.Tokens.AccessToken == "" {
+		return Account{}, errors.New("invalid ChatGPT login credentials")
+	}
+	return account, nil
+}
+
+func accountFromAuth(name, path string, auth AuthFile) Account {
 	account := Account{Name: name, Path: path, AccountID: auth.Tokens.AccountID, Auth: auth}
 	claims := decodeTokenClaims(auth.Tokens.IDToken)
 	if len(claims) == 0 {
@@ -407,6 +485,7 @@ func (m *AccountManager) readAccount(name, path string) (Account, error) {
 	account.DisplayName = asString(claims["name"])
 	account.Provider = asString(claims["auth_provider"])
 	authClaim, _ := claims["https://api.openai.com/auth"].(map[string]any)
+	account.UserID = firstString(authClaim["chatgpt_user_id"], authClaim["user_id"], claims["sub"])
 	if account.Provider == "" {
 		account.Provider = asString(authClaim["auth_provider"])
 	}
@@ -418,7 +497,7 @@ func (m *AccountManager) readAccount(name, path string) (Account, error) {
 		account.AccountID = asString(authClaim["chatgpt_account_id"])
 	}
 
-	return account, nil
+	return account
 }
 
 func fetchUsageEndpoint(endpoint, token, accountID string) (UsageSnapshot, error) {
