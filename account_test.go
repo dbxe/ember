@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -56,16 +57,19 @@ func TestHomesExpandsTildeAndPreservesOrder(t *testing.T) {
 }
 
 func TestMalformedHomesIsVisibleMenuError(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
 	for _, contents := range []string{
 		`[`, `null`, `{}`, `[null]`,
 		`[{"name":"work"}]`,
 		`[{"name":"","home":"~/.codex"}]`,
 		`[{"name":"work","home":"relative"}]`,
 		`[{"name":"work","home":7}]`,
+		`[{"name":"work","home":"~/.codex"},{"name":"main","home":"~/.codex/../.codex/"}]`,
+		fmt.Sprintf(`[{"name":"work","home":"~/.codex"},{"name":"main","home":%q}]`, filepath.Join(home, ".codex")),
 		`[{"name":"work","home":"~/.codex"},{"name":"work","home":"~/.codex_main"}]`,
 	} {
 		t.Run(contents, func(t *testing.T) {
-			t.Setenv("HOME", t.TempDir())
 			a := NewApp()
 			writeTestFile(t, a.manager.homesPath, contents)
 			a.HandleMenuAction(TagRefresh)

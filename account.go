@@ -75,6 +75,7 @@ func (m *AccountManager) ListAccounts() ([]Account, error) {
 		return nil, err
 	}
 	names := make(map[string]bool, len(accounts))
+	homes := make(map[string]bool, len(accounts))
 	for i := range accounts {
 		account := &accounts[i]
 		if strings.TrimSpace(account.Name) == "" || names[account.Name] {
@@ -90,44 +91,52 @@ func (m *AccountManager) ListAccounts() ([]Account, error) {
 			return nil, fmt.Errorf("homes.json: home for %q must be an absolute path or start with ~/", account.Name)
 		}
 		account.Home = filepath.Clean(account.Home)
+		if homes[account.Home] {
+			return nil, fmt.Errorf("homes.json: duplicate home for %q", account.Name)
+		}
+		homes[account.Home] = true
 	}
 	return accounts, nil
 }
 
 func (m *AccountManager) FetchUsage(account Account) (UsageSnapshot, error) {
 	data, err := os.ReadFile(filepath.Join(account.Home, "auth.json"))
-	if err != nil {
-		return UsageSnapshot{}, fmt.Errorf("read %s login: %w", account.Name, err)
-	}
 	var auth AuthFile
-	if err := json.Unmarshal(data, &auth); err != nil {
-		return UsageSnapshot{}, fmt.Errorf("read %s login: %w", account.Name, err)
+	if err == nil {
+		err = json.Unmarshal(data, &auth)
 	}
-	tokens := []struct {
-		label string
-		value string
-	}{
-		{label: "access_token", value: auth.Tokens.AccessToken},
-		{label: "id_token", value: auth.Tokens.IDToken},
-	}
-	endpoints := []string{usageEndpointBackend, usageEndpointAPI, usageEndpointWHAM}
-
-	for _, token := range tokens {
-		if token.value == "" {
-			continue
+	var usageErrors []error
+	if err != nil {
+		usageErrors = append(usageErrors, fmt.Errorf("read %s login: %w", account.Name, err))
+	} else {
+		tokens := []struct {
+			label string
+			value string
+		}{
+			{label: "access_token", value: auth.Tokens.AccessToken},
+			{label: "id_token", value: auth.Tokens.IDToken},
 		}
-		for _, endpoint := range endpoints {
-			usage, err := fetchUsageEndpoint(endpoint, token.value, auth.Tokens.AccountID)
-			if err == nil {
-				usage.Source = endpoint + " via " + token.label
-				return usage, nil
+		endpoints := []string{usageEndpointBackend, usageEndpointAPI, usageEndpointWHAM}
+
+		for _, token := range tokens {
+			if token.value == "" {
+				continue
+			}
+			for _, endpoint := range endpoints {
+				usage, err := fetchUsageEndpoint(endpoint, token.value, auth.Tokens.AccountID)
+				if err == nil {
+					usage.Source = endpoint + " via " + token.label
+					return usage, nil
+				}
+				usageErrors = append(usageErrors, fmt.Errorf("%s via %s: %w", endpoint, token.label, err))
 			}
 		}
 	}
 
 	usage, err := m.fetchUsageFromServer(account)
 	if err != nil {
-		return UsageSnapshot{}, fmt.Errorf("weekly Codex usage unavailable: %w", err)
+		usageErrors = append(usageErrors, fmt.Errorf("Codex usage fallback: %w", err))
+		return UsageSnapshot{}, fmt.Errorf("weekly Codex usage unavailable: %w", errors.Join(usageErrors...))
 	}
 	return usage, nil
 }
@@ -143,7 +152,7 @@ func (m *AccountManager) WarmAccount(account Account) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	replyPath := filepath.Join(root, "reply.txt")
-	cmd := exec.CommandContext(ctx, codexCommandPath(), "exec",
+	cmd := exec.CommandContext(ctx, codexCommandPath(), "exec", "--ignore-user-config",
 		"--skip-git-repo-check", "--sandbox", "read-only", "--color", "never",
 		"--model", "gpt-6-luna", "-c", `model_reasoning_effort="low"`,
 		"--ephemeral", "--output-last-message", replyPath,

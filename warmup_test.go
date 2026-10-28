@@ -107,14 +107,17 @@ test -z "${CODEX_API_KEY+x}"
 test -z "${OPENAI_BASE_URL+x}"
 if test -n "${EMBER_TEST_PROBES:-}"; then echo probe >> "$EMBER_TEST_PROBES"; fi
 model=""
+ignore_user_config=""
 while [ "$#" -gt 0 ]; do
  case "$1" in
+  --ignore-user-config) ignore_user_config=yes ;;
   --model) shift; model="$1" ;;
   --output-last-message) shift; test "$(cd "$(dirname "$1")" && pwd -P)" = "$(pwd -P)"; printf 'OK\n' > "$1" ;;
  esac
  shift
 done
 test "$model" = gpt-6-luna
+test "$ignore_user_config" = yes
 `
 
 func TestRefreshWarmsHomeOnceAndPersistsConfirmation(t *testing.T) {
@@ -218,14 +221,17 @@ func TestWarmProbeRequiresResponse(t *testing.T) {
 }
 
 func TestReadOnlyFallback(t *testing.T) {
-	a := testRefreshApp(t)
-	t.Setenv("EMBER_TEST_HOME", os.Getenv("HOME"))
-	t.Setenv("EMBER_TEST_CODEX_HOME", filepath.Join(os.Getenv("HOME"), ".codex_main"))
-	t.Setenv("CODEX_HOME", "must-not-inherit")
-	t.Setenv("OPENAI_API_KEY", "must-not-inherit")
-	t.Setenv("CODEX_API_KEY", "must-not-inherit")
-	t.Setenv("OPENAI_BASE_URL", "must-not-inherit")
-	fakeCodex(t, `test "$*" = "app-server --listen stdio://"
+	for _, fallbackFails := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fallbackFails=%t", fallbackFails), func(t *testing.T) {
+			a := testRefreshApp(t)
+			t.Setenv("EMBER_TEST_FALLBACK_FAILS", fmt.Sprint(fallbackFails))
+			t.Setenv("EMBER_TEST_HOME", os.Getenv("HOME"))
+			t.Setenv("EMBER_TEST_CODEX_HOME", filepath.Join(os.Getenv("HOME"), ".codex_main"))
+			t.Setenv("CODEX_HOME", "must-not-inherit")
+			t.Setenv("OPENAI_API_KEY", "must-not-inherit")
+			t.Setenv("CODEX_API_KEY", "must-not-inherit")
+			t.Setenv("OPENAI_BASE_URL", "must-not-inherit")
+			fakeCodex(t, `test "$*" = "app-server --listen stdio://"
 test "$HOME" = "$EMBER_TEST_HOME"
 test "$CODEX_HOME" = "$EMBER_TEST_CODEX_HOME"
 test "$(pwd -P)" = "$(cd "$CODEX_HOME" && pwd -P)"
@@ -238,22 +244,39 @@ printf '%s\n' '{"id":1,"result":{}}'
 read -r initialized
 read -r request
 case "$request" in *'"method":"account/rateLimits/read"'*) ;; *) exit 1 ;; esac
+if test "$EMBER_TEST_FALLBACK_FAILS" = true; then
+ printf '%s\n' '{"id":2,"error":{"message":"fallback unavailable"}}'
+ exit 0
+fi
 printf '%s\n' '{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":90,"windowDurationMins":10080,"resetsAt":1790428295}},"rateLimitsByLimitId":{"codex":{"primary":{"usedPercent":0,"windowDurationMins":10080,"resetsAt":1790428295}}}}}'
 `)
-	original := http.DefaultTransport
-	t.Cleanup(func() { http.DefaultTransport = original })
-	http.DefaultTransport = usageTransport(func(r *http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: 401, Status: "401 Unauthorized", Body: io.NopCloser(strings.NewReader("expired"))}, nil
-	})
-	accounts, err := a.manager.ListAccounts()
-	if err != nil {
-		t.Fatal(err)
+			original := http.DefaultTransport
+			t.Cleanup(func() { http.DefaultTransport = original })
+			http.DefaultTransport = usageTransport(func(r *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: 401, Status: "401 Unauthorized", Body: io.NopCloser(strings.NewReader("expired at " + r.URL.String()))}, nil
+			})
+			accounts, err := a.manager.ListAccounts()
+			if err != nil {
+				t.Fatal(err)
+			}
+			u, err := a.manager.FetchUsage(accounts[1])
+			if fallbackFails {
+				if err == nil || !strings.Contains(err.Error(), "fallback unavailable") {
+					t.Fatalf("fallback error = %v", err)
+				}
+				for _, endpoint := range []string{usageEndpointBackend, usageEndpointAPI, usageEndpointWHAM} {
+					if !strings.Contains(err.Error(), "expired at "+endpoint) {
+						t.Fatalf("missing direct error for %s: %v", endpoint, err)
+					}
+				}
+				return
+			}
+			if err != nil || u.WeeklyUsedPct == nil || *u.WeeklyUsedPct != 0 {
+				t.Fatalf("usage=%+v err=%v", u, err)
+			}
+			assertFileContents(t, filepath.Join(accounts[1].Home, "auth.json"), testAuth("main", "main-token"))
+		})
 	}
-	u, err := a.manager.FetchUsage(accounts[1])
-	if err != nil || u.WeeklyUsedPct == nil || *u.WeeklyUsedPct != 0 {
-		t.Fatalf("usage=%+v err=%v", u, err)
-	}
-	assertFileContents(t, filepath.Join(accounts[1].Home, "auth.json"), testAuth("main", "main-token"))
 }
 
 func TestInterruptedProbeAndMissingResetDoNotLoop(t *testing.T) {

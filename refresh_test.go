@@ -114,26 +114,60 @@ func TestUsageRefreshReadsEachHomeWithoutWritingCredentials(t *testing.T) {
 }
 
 func TestMissingHomeLoginStaysVisible(t *testing.T) {
-	a := testRefreshApp(t)
-	if err := os.Remove(filepath.Join(os.Getenv("HOME"), ".codex_main", "auth.json")); err != nil {
-		t.Fatal(err)
-	}
-	// The other home's direct usage read succeeds without starting Codex.
-	original := http.DefaultTransport
-	t.Cleanup(func() { http.DefaultTransport = original })
-	http.DefaultTransport = usageTransport(func(r *http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"rate_limit":{"primary_window":{"used_percent":20,"window_minutes":10080}}}`))}, nil
-	})
-	if err := a.refreshAccounts(true); err != nil {
-		t.Fatal(err)
-	}
-	if len(a.accounts) != 2 || a.state.Accounts["main"].Usage.Error == "" {
-		t.Fatalf("missing login disappeared: %+v", a.accounts)
-	}
-	for _, entry := range buildMenuEntries(a.accounts, "") {
-		if strings.Contains(entry.Title, "read main login:") {
-			return
+	for _, login := range []string{"missing", "unparseable"} {
+		for _, fallbackFails := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/fallbackFails=%t", login, fallbackFails), func(t *testing.T) {
+				a := testRefreshApp(t)
+				path := filepath.Join(os.Getenv("HOME"), ".codex_main", "auth.json")
+				if login == "missing" {
+					if err := os.Remove(path); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					writeTestFile(t, path, `{"tokens":{"access_token":"must-not-use","account_id":7}}`)
+				}
+				t.Setenv("EMBER_TEST_FALLBACK_FAILS", fmt.Sprint(fallbackFails))
+				fakeCodex(t, `test "$1" = app-server
+read -r initialize
+printf '%s\n' '{"id":1,"result":{}}'
+read -r initialized
+read -r request
+if test "$EMBER_TEST_FALLBACK_FAILS" = true; then
+ printf '%s\n' '{"id":2,"error":{"message":"fallback unavailable"}}'
+else
+ printf '%s\n' '{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":34,"windowDurationMins":10080}}}}'
+fi
+`)
+				original := http.DefaultTransport
+				t.Cleanup(func() { http.DefaultTransport = original })
+				http.DefaultTransport = usageTransport(func(r *http.Request) (*http.Response, error) {
+					if r.Header.Get("OpenAI-Account-ID") != "work" {
+						t.Error("unreadable login must skip direct usage requests")
+					}
+					return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"rate_limit":{"primary_window":{"used_percent":20,"window_minutes":10080}}}`))}, nil
+				})
+				if err := a.refreshAccounts(true); err != nil {
+					t.Fatal(err)
+				}
+				if len(a.accounts) != 2 {
+					t.Fatalf("configured home disappeared: %+v", a.accounts)
+				}
+				usage := a.state.Accounts["main"].Usage
+				if fallbackFails {
+					if !strings.Contains(usage.Error, "read main login:") || !strings.Contains(usage.Error, "fallback unavailable") {
+						t.Fatalf("missing combined login and fallback error: %s", usage.Error)
+					}
+				} else if usage.Error != "" || usage.WeeklyUsedPct == nil || *usage.WeeklyUsedPct != 34 {
+					t.Fatalf("fallback usage = %+v", usage)
+				}
+				visible := false
+				for _, entry := range buildMenuEntries(a.accounts, "") {
+					visible = visible || strings.Contains(entry.Title, "read main login:")
+				}
+				if visible != fallbackFails {
+					t.Fatalf("login error visible = %t, want %t", visible, fallbackFails)
+				}
+			})
 		}
 	}
-	t.Fatal("menu must show the login error")
 }
