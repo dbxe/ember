@@ -97,24 +97,30 @@ func TestUnconfirmedWarmupBacksOff(t *testing.T) {
 
 const acknowledgmentScript = `
 test "$1" = exec
-test "$(pwd -P)" = "$(cd "$HOME" && pwd -P)"
-test "$CODEX_HOME" = "$HOME/.codex"
-test -z "${OPENAI_API_KEY:-}"
-test -z "${CODEX_API_KEY:-}"
-test -z "${OPENAI_BASE_URL:-}"
+test "$HOME" = "$EMBER_TEST_HOME"
+test "$CODEX_HOME" = "$EMBER_TEST_CODEX_HOME"
+test "$(pwd -P)" != "$(cd "$CODEX_HOME" && pwd -P)"
+test -z "$(ls -A)"
+if test -n "${EMBER_TEST_WORKDIR:-}"; then pwd -P > "$EMBER_TEST_WORKDIR"; fi
+test -z "${OPENAI_API_KEY+x}"
+test -z "${CODEX_API_KEY+x}"
+test -z "${OPENAI_BASE_URL+x}"
 if test -n "${EMBER_TEST_PROBES:-}"; then echo probe >> "$EMBER_TEST_PROBES"; fi
 model=""
+ignore_user_config=""
 while [ "$#" -gt 0 ]; do
  case "$1" in
+  --ignore-user-config) ignore_user_config=yes ;;
   --model) shift; model="$1" ;;
-  --output-last-message) shift; printf 'OK\n' > "$1" ;;
+  --output-last-message) shift; test "$(cd "$(dirname "$1")" && pwd -P)" = "$(pwd -P)"; printf 'OK\n' > "$1" ;;
  esac
  shift
 done
 test "$model" = gpt-6-luna
+test "$ignore_user_config" = yes
 `
 
-func TestRefreshWarmsInactiveAccountOnceAndPersistsConfirmation(t *testing.T) {
+func TestRefreshWarmsHomeOnceAndPersistsConfirmation(t *testing.T) {
 	a := testRefreshApp(t)
 	now := time.Now().Truncate(time.Second)
 	a.now = func() time.Time { return now }
@@ -123,7 +129,12 @@ func TestRefreshWarmsInactiveAccountOnceAndPersistsConfirmation(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "must-not-inherit")
 	t.Setenv("CODEX_API_KEY", "must-not-inherit")
 	t.Setenv("OPENAI_BASE_URL", "must-not-inherit")
-	writeTestFile(t, filepath.Join(a.manager.codexDir, "config.toml"), "model = \"expensive-model\"\n")
+
+	t.Setenv("EMBER_TEST_HOME", os.Getenv("HOME"))
+	t.Setenv("EMBER_TEST_CODEX_HOME", filepath.Join(os.Getenv("HOME"), ".codex_main"))
+	t.Setenv("CODEX_HOME", "must-not-inherit")
+	workdirMarker := filepath.Join(t.TempDir(), "workdir")
+	t.Setenv("EMBER_TEST_WORKDIR", workdirMarker)
 	fakeCodex(t, acknowledgmentScript)
 	var fixed time.Time
 	original := http.DefaultTransport
@@ -161,8 +172,15 @@ func TestRefreshWarmsInactiveAccountOnceAndPersistsConfirmation(t *testing.T) {
 		t.Fatalf("missing pending verification: %+v", a.state.Accounts["main"].Warmup)
 	}
 	assertFileContents(t, marker, "probe\n")
-	assertFileContents(t, a.manager.currentPath, "work\n")
-	assertFileContents(t, a.manager.authPath, testAuth("work", "old"))
+	assertFileContents(t, filepath.Join(os.Getenv("HOME"), ".codex", "auth.json"), testAuth("work", "old"))
+	assertFileContents(t, filepath.Join(os.Getenv("HOME"), ".codex_main", "auth.json"), testAuth("main", "main-token"))
+	workdir, err := os.ReadFile(workdirMarker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(strings.TrimSpace(string(workdir))); !os.IsNotExist(err) {
+		t.Fatalf("probe directory was not removed: %v", err)
+	}
 	// A restart and repeated manual refresh must not submit another probe.
 	a = NewApp()
 	a.now = func() time.Time { return now }
@@ -175,7 +193,7 @@ func TestRefreshWarmsInactiveAccountOnceAndPersistsConfirmation(t *testing.T) {
 	if a.state.Accounts["main"].Warmup.Phase != "confirmed" {
 		t.Fatalf("warmup=%+v", a.state.Accounts["main"].Warmup)
 	}
-	entries := buildMenuEntries(a.accounts, a.activeName, "")
+	entries := buildMenuEntries(a.accounts, "")
 	found := false
 	for _, e := range entries {
 		if strings.Contains(e.Title, "countdown confirmed") {
@@ -193,39 +211,71 @@ func TestRefreshWarmsInactiveAccountOnceAndPersistsConfirmation(t *testing.T) {
 func TestWarmProbeRequiresResponse(t *testing.T) {
 	a := testRefreshApp(t)
 	fakeCodex(t, "exit 0\n")
-	account, err := a.manager.readAccount("main", filepath.Join(a.manager.accountsDir, "main.json"))
+	accounts, err := a.manager.ListAccounts()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = a.manager.WarmAccount(account); err == nil || !strings.Contains(err.Error(), "no acknowledgment") {
+	if err = a.manager.WarmAccount(accounts[1]); err == nil || !strings.Contains(err.Error(), "no acknowledgment") {
 		t.Fatalf("error=%v", err)
 	}
 }
 
 func TestReadOnlyFallback(t *testing.T) {
-	a := testRefreshApp(t)
-	fakeCodex(t, `test "$1" = app-server
+	for _, fallbackFails := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fallbackFails=%t", fallbackFails), func(t *testing.T) {
+			a := testRefreshApp(t)
+			t.Setenv("EMBER_TEST_FALLBACK_FAILS", fmt.Sprint(fallbackFails))
+			t.Setenv("EMBER_TEST_HOME", os.Getenv("HOME"))
+			t.Setenv("EMBER_TEST_CODEX_HOME", filepath.Join(os.Getenv("HOME"), ".codex_main"))
+			t.Setenv("CODEX_HOME", "must-not-inherit")
+			t.Setenv("OPENAI_API_KEY", "must-not-inherit")
+			t.Setenv("CODEX_API_KEY", "must-not-inherit")
+			t.Setenv("OPENAI_BASE_URL", "must-not-inherit")
+			fakeCodex(t, `test "$*" = "app-server --listen stdio://"
+test "$HOME" = "$EMBER_TEST_HOME"
+test "$CODEX_HOME" = "$EMBER_TEST_CODEX_HOME"
+test "$(pwd -P)" = "$(cd "$CODEX_HOME" && pwd -P)"
+test -z "${OPENAI_API_KEY+x}"
+test -z "${CODEX_API_KEY+x}"
+test -z "${OPENAI_BASE_URL+x}"
 read -r initialize
+case "$initialize" in *'"method":"initialize"'*) ;; *) exit 1 ;; esac
 printf '%s\n' '{"id":1,"result":{}}'
 read -r initialized
 read -r request
+case "$request" in *'"method":"account/rateLimits/read"'*) ;; *) exit 1 ;; esac
+if test "$EMBER_TEST_FALLBACK_FAILS" = true; then
+ printf '%s\n' '{"id":2,"error":{"message":"fallback unavailable"}}'
+ exit 0
+fi
 printf '%s\n' '{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":90,"windowDurationMins":10080,"resetsAt":1790428295}},"rateLimitsByLimitId":{"codex":{"primary":{"usedPercent":0,"windowDurationMins":10080,"resetsAt":1790428295}}}}}'
 `)
-	original := http.DefaultTransport
-	t.Cleanup(func() { http.DefaultTransport = original })
-	http.DefaultTransport = usageTransport(func(r *http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: 401, Status: "401 Unauthorized", Body: io.NopCloser(strings.NewReader("expired"))}, nil
-	})
-	account, err := a.manager.readAccount("main", filepath.Join(a.manager.accountsDir, "main.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	u, err := a.manager.FetchUsage(account)
-	if err != nil || u.WeeklyUsedPct == nil || *u.WeeklyUsedPct != 0 {
-		t.Fatalf("usage=%+v err=%v", u, err)
-	}
-	if entries, _ := os.ReadDir(a.manager.cacheDir); len(entries) != 0 {
-		t.Fatal("temporary credentials left behind")
+			original := http.DefaultTransport
+			t.Cleanup(func() { http.DefaultTransport = original })
+			http.DefaultTransport = usageTransport(func(r *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: 401, Status: "401 Unauthorized", Body: io.NopCloser(strings.NewReader("expired at " + r.URL.String()))}, nil
+			})
+			accounts, err := a.manager.ListAccounts()
+			if err != nil {
+				t.Fatal(err)
+			}
+			u, err := a.manager.FetchUsage(accounts[1])
+			if fallbackFails {
+				if err == nil || !strings.Contains(err.Error(), "fallback unavailable") {
+					t.Fatalf("fallback error = %v", err)
+				}
+				for _, endpoint := range []string{usageEndpointBackend, usageEndpointAPI, usageEndpointWHAM} {
+					if !strings.Contains(err.Error(), "expired at "+endpoint) {
+						t.Fatalf("missing direct error for %s: %v", endpoint, err)
+					}
+				}
+				return
+			}
+			if err != nil || u.WeeklyUsedPct == nil || *u.WeeklyUsedPct != 0 {
+				t.Fatalf("usage=%+v err=%v", u, err)
+			}
+			assertFileContents(t, filepath.Join(accounts[1].Home, "auth.json"), testAuth("main", "main-token"))
+		})
 	}
 }
 

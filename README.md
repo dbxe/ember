@@ -1,62 +1,60 @@
 # Ember
 
-Ember is a tiny native macOS menu bar app for switching between local Codex accounts and seeing each account's weekly usage.
+Ember is a native macOS menu bar app that shows weekly Codex usage per account and keeps accounts warm. Each account lives in its own Codex home. The menu shows its name, weekly percentage used, reset date in your local timezone, and warming progress or errors. Refresh usage and Quit are the only menu actions.
 
-## What it does
+## Configure accounts
 
-- manages saved `~/.codex/accounts/*.json` snapshots
-- switches the active local Codex account without symlink-based auth churn
-- shows the percentage of each account's weekly Codex allowance that has been used
-- shows each account's weekly reset date and time in your local timezone, or indicates when it is unavailable
-- automatically warms cold accounts after their weekly allowance resets
+Create `~/.codex/ember/homes.json` with a list of named Codex homes:
 
-Ember persists the active `~/.codex/auth.json` back into its named snapshot before switching, then atomically copies the selected snapshot into place. This preserves refresh-token rotation without changing normal `codex login` or `codex logout` behavior.
-
-Before each usage refresh, Ember also synchronizes the active credentials into their snapshot so it picks up logins renewed by Codex while Ember is running. If a Codex usage read or warming probe renews credentials for the active account, Ember updates both copies, including when the request fails after renewal.
-
-Ember verifies both account and user identity before saving credentials. If a login outside Ember no longer matches the current account marker, it preserves the saved snapshot and reports the mismatch. Account switches and credential persistence coordinate with external Ember helpers through a shared file lock. If multiple names contain the same login, the menu labels the duplicate and only checks or warms that login once; the names do not represent separate allowances. Reauthenticate the duplicate name to restore its intended login.
-
-Weekly usage refreshes every ten minutes and can be refreshed manually from the menu. If the usage endpoint is unavailable for local snapshot credentials, Ember reads rate limits through an isolated Codex app server. Usage checks do not generate model responses.
-
-After a weekly reset, an unused account can show 0% usage with a reset time that keeps moving exactly seven days ahead. Ember checks again after 90 seconds to confirm that the reset is moving, then sends one small acknowledgment request to `gpt-6-luna`. It checks the reset again after at least 90 seconds and confirms warming only when the timestamp stays fixed and starts counting down. Accounts already counting down are left alone, even when usage still rounds to 0%.
-
-Warming works for active and inactive accounts without switching your current account. The probe uses a temporary home with only the account credentials, a read-only sandbox, and no inherited user configuration or API key. Ember shows warming progress or retry errors in the menu, persists attempts across restarts, and limits failed attempts to at most one per hour. After confirmation, it returns to the normal ten-minute usage schedule. Codex CLI must be installed and support `gpt-6-luna`.
-
-## Add another account
-
-Quit Ember, then run:
-
-```bash
-make add-account NAME=work
+```json
+[
+  {"name": "work", "home": "~/.codex"},
+  {"name": "main", "home": "~/.codex_main"}
+]
 ```
 
-The helper preserves the current account snapshot, runs the normal `codex logout` and `codex login` flow, and saves the new login as `~/.codex/accounts/work.json`. If login is canceled or fails, it restores the previous login.
+Names must be nonempty and unique. Home paths must be absolute or start with `~/`; `~` expands to your home directory. If the file is missing, Ember uses only `{"name":"work","home":"~/.codex"}`. An empty list shows no accounts, and malformed configuration appears as an error in the menu. Refresh usage reloads the list.
 
-After the helper finishes, start Ember again. The new account appears in the menu and is active. Click either account row to switch.
-
-Account names may contain letters, numbers, dots, underscores, and hyphens. The helper refuses to overwrite an existing account.
-
-If an existing account's login expires or is revoked, quit Ember and reauthenticate it in place:
+To add an account, log in to a separate home, then add its entry to `homes.json`:
 
 ```bash
-make reauth-account NAME=work
+mkdir -p ~/.codex_main && CODEX_HOME=~/.codex_main codex login
 ```
 
-## Build
+To reauthenticate an account, run `CODEX_HOME=<home> codex login`, replacing `<home>` with that account's home path. For example:
+
+```bash
+CODEX_HOME=~/.codex_main codex login
+```
+
+Ember never writes credentials. It reads each home's `auth.json` for direct usage requests; when those requests fail or the login file cannot be read or parsed, the usage fallback runs `codex app-server --listen stdio://` in the home with that home's `CODEX_HOME` to read `account/rateLimits/read`. Codex itself may renew credentials in that home. Usage reads do not generate model responses.
+
+`~/.codex/accounts/` is no longer read and can be deleted once the accounts live in their own homes.
+
+## Warming
+
+Weekly usage refreshes every ten minutes and can also be refreshed from the menu. After a reset, an unused account can show 0% usage with a reset time that keeps moving seven days ahead. Ember checks again after 90 seconds to confirm movement, then sends one small acknowledgment request to `gpt-6-luna`. It checks again after at least 90 seconds and confirms warming only when the reset stays fixed and starts counting down. Accounts already counting down are left alone, even when usage rounds to 0%.
+
+The warming probe runs `codex exec` in the account's real Codex home with `--ephemeral` and a read-only sandbox. The warming probe uses `--ignore-user-config` to ignore the home's `config.toml`, so it does not start the home's MCP servers, hooks, or plugins. Its working directory is a fresh empty temporary directory, removed afterward, containing only the acknowledgment output. Both usage fallback and warming preserve `HOME`, set `CODEX_HOME` to the configured home, and strip `OPENAI_API_KEY`, `CODEX_API_KEY`, and `OPENAI_BASE_URL`.
+
+Ember persists warming state by account name in `~/.codex/ember/state.json`, including attempts across restarts. Failed probes retry at most once per hour. After confirmation, Ember returns to the ten-minute usage schedule. Codex CLI must be installed and support `gpt-6-luna`.
+
+## Build and install
 
 ```bash
 go build ./...
 make bundle
-```
-
-## Install
-
-```bash
 make install
 ```
 
 ## Verify
 
-Run the automated tests with `go test -race ./...` and `go vet ./...`.
+```bash
+gofmt -l .
+go vet ./...
+go test -race ./...
+go build ./...
+make bundle
+```
 
-For opt-in checks against the saved accounts, use `EMBER_LIVE_OBSERVE=1 go test -run TestLiveObserve -count=1 -v` to print live usage and reset timestamps, or `EMBER_LIVE_SERVER=1 go test -run TestLiveReadServer -count=1 -v` to check the read-only fallback. Neither check sends a model prompt; the fallback can renew saved credentials, so quit Ember before running that check.
+The automated tests use synthetic homes and a fake Codex executable, without reading real credentials or calling live services.

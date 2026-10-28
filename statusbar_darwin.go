@@ -77,6 +77,7 @@ static NSImage *emberStatusImage(void) {
 	[statusItem.button setAccessibilityLabel:title];
 
 	statusMenu = [[NSMenu alloc] init];
+	statusMenu.autoenablesItems = NO;
 	statusMenu.delegate = self;
 	statusItem.menu = statusMenu;
 }
@@ -119,20 +120,6 @@ void initStatusBarOnMainThread(const char *title) {
     }
 }
 
-void setStatusTitleOnMainThread(const char *title) {
-    if (statusItem == nil) return;
-    NSString *nsTitle = [NSString stringWithUTF8String:title];
-    if ([NSThread isMainThread]) {
-        statusItem.button.toolTip = nsTitle;
-        [statusItem.button setAccessibilityLabel:nsTitle];
-    } else {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            statusItem.button.toolTip = nsTitle;
-            [statusItem.button setAccessibilityLabel:nsTitle];
-        });
-    }
-}
-
 void clearMenuOnMainThread() {
     if (statusMenu == nil) return;
     if ([NSThread isMainThread]) {
@@ -144,7 +131,7 @@ void clearMenuOnMainThread() {
     }
 }
 
-void addMenuItemOnMainThread(const char *title, int tag, int enabled, int checked) {
+void addMenuItemOnMainThread(const char *title, int tag, int enabled) {
     if (statusMenu == nil || delegate == nil) return;
 
     NSString *nsTitle = [NSString stringWithUTF8String:title];
@@ -155,7 +142,6 @@ void addMenuItemOnMainThread(const char *title, int tag, int enabled, int checke
         [item setTarget:delegate];
         [item setTag:tag];
         [item setEnabled:enabled != 0];
-        [item setState:checked != 0 ? NSControlStateValueOn : NSControlStateValueOff];
         [statusMenu addItem:item];
     };
 
@@ -208,14 +194,8 @@ import (
 )
 
 const (
-	TagHeader = iota + 1
-	TagRefresh
+	TagRefresh = iota + 1
 	TagQuit
-)
-
-const (
-	TagAccountBase = 1000
-	TagDetailsBase = 2000
 )
 
 var statusBarApp *App
@@ -250,12 +230,6 @@ func clickLoop() {
 	}
 }
 
-func SetStatusTitle(title string) {
-	cTitle := C.CString(title)
-	defer C.free(unsafe.Pointer(cTitle))
-	C.setStatusTitleOnMainThread(cTitle)
-}
-
 func ClearMenu() {
 	C.clearMenuOnMainThread()
 }
@@ -268,7 +242,7 @@ func StatusMenuIsOpen() bool {
 	return C.statusMenuIsAttached() != 0
 }
 
-func addMenuItem(title string, tag int, enabled bool, checked bool) {
+func addMenuItem(title string, tag int, enabled bool) {
 	cTitle := C.CString(title)
 	defer C.free(unsafe.Pointer(cTitle))
 
@@ -276,11 +250,7 @@ func addMenuItem(title string, tag int, enabled bool, checked bool) {
 	if enabled {
 		e = 1
 	}
-	var state C.int
-	if checked {
-		state = 1
-	}
-	C.addMenuItemOnMainThread(cTitle, C.int(tag), e, state)
+	C.addMenuItemOnMainThread(cTitle, C.int(tag), e)
 }
 
 func RemoveStatusBar() {

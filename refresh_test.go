@@ -19,20 +19,22 @@ func testRefreshApp(t *testing.T) *App {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())
 	a := NewApp()
-	writeTestFile(t, a.manager.currentPath, "work\n")
-	writeTestFile(t, a.manager.authPath, testAuth("work", "old"))
-	writeTestFile(t, filepath.Join(a.manager.accountsDir, "work.json"), testAuth("work", "old"))
-	writeTestFile(t, filepath.Join(a.manager.accountsDir, "main.json"), testAuth("main", "main-token"))
+	writeTestFile(t, a.manager.homesPath, `[{"name":"work","home":"~/.codex"},{"name":"main","home":"~/.codex_main"}]`)
+	writeTestFile(t, filepath.Join(os.Getenv("HOME"), ".codex", "auth.json"), testAuth("work", "old"))
+	writeTestFile(t, filepath.Join(os.Getenv("HOME"), ".codex_main", "auth.json"), testAuth("main", "main-token"))
 	return a
 }
 
 func testAuth(account, token string) string {
-	return fmt.Sprintf(`{"tokens":{"account_id":%q,"access_token":%q,"refresh_token":%q}}`, account, token, token+"-refresh")
+	return fmt.Sprintf(`{"tokens":{"account_id":%q,"access_token":%q}}`, account, token)
 }
 
 func writeTestFile(t *testing.T, path, contents string) {
 	t.Helper()
-	if err := writeTextAtomic(path, contents, 0o600); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -53,162 +55,119 @@ func fakeCodex(t *testing.T, script string) {
 	t.Setenv("PATH", filepath.Join(root, "bin")+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
-func TestUsageRefreshPicksUpActiveCredentialRenewal(t *testing.T) {
+func assertFileContents(t *testing.T, path, want string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != want {
+		t.Fatalf("%s = %q, want %q", path, data, want)
+	}
+}
+
+func TestUsageRefreshReadsEachHomeWithoutWritingCredentials(t *testing.T) {
 	for _, manual := range []bool{false, true} {
 		t.Run(fmt.Sprintf("manual=%t", manual), func(t *testing.T) {
 			a := testRefreshApp(t)
-			fakeCodex(t, "exit 1\n")
-			originalTransport := http.DefaultTransport
-			t.Cleanup(func() { http.DefaultTransport = originalTransport })
+			original := http.DefaultTransport
+			t.Cleanup(func() { http.DefaultTransport = original })
+			requests := map[string]string{}
 			http.DefaultTransport = usageTransport(func(r *http.Request) (*http.Response, error) {
+				requests[r.Header.Get("OpenAI-Account-ID")] = r.Header.Get("Authorization")
 				body := `{"rate_limit":{"primary_window":{"used_percent":54,"limit_window_seconds":604800,"reset_at":1790428295}}}`
-				status := http.StatusOK
-				if r.Header.Get("Authorization") == "Bearer old" {
-					status = http.StatusUnauthorized
-					body = `{"error":{"code":"token_expired"}}`
-				}
-				return &http.Response{StatusCode: status, Status: http.StatusText(status), Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body))}, nil
 			})
-
 			if err := a.loadAccountsFromDisk(); err != nil {
 				t.Fatal(err)
 			}
-			// Codex renews auth while Ember is already running.
-			writeTestFile(t, a.manager.authPath, testAuth("work", "renewed"))
+			workAuth := filepath.Join(os.Getenv("HOME"), ".codex", "auth.json")
+			writeTestFile(t, workAuth, testAuth("work", "renewed"))
 			if manual {
 				a.HandleMenuAction(TagRefresh)
 			} else if err := a.refreshAccounts(false); err != nil {
 				t.Fatal(err)
 			}
-			entries := buildMenuEntries(a.accounts, a.activeName, a.lastError)
-			found := false
-			for _, entry := range entries {
-				if entry.Title == "work    Weekly 54% used" && entry.Checked {
-					found = true
+			if requests["work"] != "Bearer renewed" || requests["main"] != "Bearer main-token" {
+				t.Fatalf("usage credentials = %v", requests)
+			}
+			for _, entry := range buildMenuEntries(a.accounts, a.lastError) {
+				if entry.Enabled && entry.Tag != TagRefresh && entry.Tag != TagQuit {
+					t.Fatalf("unexpected clickable entry: %+v", entry)
 				}
 			}
-			if !found {
-				t.Fatalf("refreshed menu is missing active work usage: %+v", entries)
-			}
-			assertFileContents(t, filepath.Join(a.manager.accountsDir, "work.json"), testAuth("work", "renewed"))
-			assertFileContents(t, filepath.Join(a.manager.accountsDir, "main.json"), testAuth("main", "main-token"))
+			assertFileContents(t, workAuth, testAuth("work", "renewed"))
+			assertFileContents(t, filepath.Join(os.Getenv("HOME"), ".codex_main", "auth.json"), testAuth("main", "main-token"))
 			if a.state.Accounts["work"].Usage.WeeklyReset.IsZero() {
 				t.Fatal("weekly reset is missing")
 			}
-			// A later refresh must observe another renewal as well.
-			writeTestFile(t, a.manager.authPath, testAuth("work", "renewed-again"))
+			writeTestFile(t, workAuth, testAuth("work", "renewed-again"))
 			a.state.Accounts["work"].LastUsageFetchedAt = time.Now().Add(-usageRefreshWindow)
 			if err := a.refreshAccounts(false); err != nil {
 				t.Fatal(err)
 			}
-			assertFileContents(t, filepath.Join(a.manager.accountsDir, "work.json"), testAuth("work", "renewed-again"))
+			if requests["work"] != "Bearer renewed-again" {
+				t.Fatalf("next refresh reused stale credentials: %v", requests)
+			}
 		})
 	}
 }
 
-func TestWarmProbePreservesRenewal(t *testing.T) {
-	for _, tc := range []struct {
-		name       string
-		account    string
-		requestErr bool
-	}{
-		{name: "active", account: "work"},
-		{name: "inactive", account: "main"},
-		{name: "active request fails after renewal", account: "work", requestErr: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			a := testRefreshApp(t)
-			m := a.manager
-			outerHome := t.TempDir()
-			t.Setenv("CODEX_HOME", outerHome)
-			writeTestFile(t, filepath.Join(outerHome, "auth.json"), "outer-auth")
-			renewed := testAuth(tc.account, "probe-renewed")
-			renewalPath := filepath.Join(t.TempDir(), "renewed.json")
-			writeTestFile(t, renewalPath, renewed)
-			t.Setenv("EMBER_TEST_RENEWAL", renewalPath)
-			script := `test "$CODEX_HOME" = "$HOME/.codex"
-cp "$EMBER_TEST_RENEWAL" "$CODEX_HOME/auth.json"
-while [ "$#" -gt 0 ]; do
- if [ "$1" = "--output-last-message" ]; then shift; printf 'OK\n' > "$1"; break; fi
- shift
-done
-`
-			if tc.requestErr {
-				script += "echo 'request failed after renewal' >&2\nexit 1\n"
-			}
-			fakeCodex(t, script)
-			account, err := m.readAccount(tc.account, filepath.Join(m.accountsDir, tc.account+".json"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			err = m.WarmAccount(account)
-			if tc.requestErr {
-				if err == nil || !strings.Contains(err.Error(), "request failed after renewal") {
-					t.Fatalf("probe error = %v", err)
+func TestMissingHomeLoginStaysVisible(t *testing.T) {
+	for _, login := range []string{"missing", "unparseable"} {
+		for _, fallbackFails := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/fallbackFails=%t", login, fallbackFails), func(t *testing.T) {
+				a := testRefreshApp(t)
+				path := filepath.Join(os.Getenv("HOME"), ".codex_main", "auth.json")
+				if login == "missing" {
+					if err := os.Remove(path); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					writeTestFile(t, path, `{"tokens":{"access_token":"must-not-use","account_id":7}}`)
 				}
-			} else if err != nil {
-				t.Fatalf("probe error = %v", err)
-			}
-			assertFileContents(t, account.Path, renewed)
-			if tc.account == "work" {
-				assertFileContents(t, m.authPath, renewed)
-			} else {
-				assertFileContents(t, m.authPath, testAuth("work", "old"))
-			}
-			assertFileContents(t, filepath.Join(outerHome, "auth.json"), "outer-auth")
-			// Persistence on the next refresh, switch, or shutdown must not
-			// overwrite the probe's rotated refresh token.
-			if err := m.PersistCurrentAuth(); err != nil {
-				t.Fatal(err)
-			}
-			assertFileContents(t, account.Path, renewed)
-		})
-	}
-}
-
-func TestUsageProbeDoesNotOverwriteChangedCredentials(t *testing.T) {
-	for _, change := range []string{"active", "snapshot", "different account", "invalid", "unchanged probe"} {
-		t.Run(change, func(t *testing.T) {
-			a := testRefreshApp(t)
-			m := a.manager
-			account, err := m.readAccount("work", filepath.Join(m.accountsDir, "work.json"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			original := testAuth("work", "old")
-			active, snapshot := original, original
-			renewed := testAuth("work", "probe-renewed")
-			switch change {
-			case "active":
-				active = testAuth("work", "codex-renewed")
-			case "snapshot":
-				snapshot = testAuth("work", "externally-renewed")
-			case "different account":
-				renewed = testAuth("other", "probe-renewed")
-			case "invalid":
-				renewed = `{}`
-			case "unchanged probe":
-				renewed = original
-				active = testAuth("work", "codex-renewed")
-			}
-			writeTestFile(t, m.authPath, active)
-			writeTestFile(t, account.Path, snapshot)
-			probePath := filepath.Join(t.TempDir(), "auth.json")
-			writeTestFile(t, probePath, renewed)
-			err = m.persistProbeAuth(account, []byte(original), probePath)
-			if (err == nil) != (change == "unchanged probe") {
-				t.Fatalf("unexpected persistence error: %v", err)
-			}
-			assertFileContents(t, m.authPath, active)
-			assertFileContents(t, account.Path, snapshot)
-		})
-	}
-}
-
-func TestUsageRefreshStopsWhenCredentialSyncFails(t *testing.T) {
-	a := testRefreshApp(t)
-	writeTestFile(t, a.manager.currentPath, "../invalid\n")
-	if err := a.refreshAccounts(true); err == nil || !strings.Contains(err.Error(), "persist current auth before usage refresh") {
-		t.Fatalf("refresh error = %v", err)
+				t.Setenv("EMBER_TEST_FALLBACK_FAILS", fmt.Sprint(fallbackFails))
+				fakeCodex(t, `test "$1" = app-server
+read -r initialize
+printf '%s\n' '{"id":1,"result":{}}'
+read -r initialized
+read -r request
+if test "$EMBER_TEST_FALLBACK_FAILS" = true; then
+ printf '%s\n' '{"id":2,"error":{"message":"fallback unavailable"}}'
+else
+ printf '%s\n' '{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":34,"windowDurationMins":10080}}}}'
+fi
+`)
+				original := http.DefaultTransport
+				t.Cleanup(func() { http.DefaultTransport = original })
+				http.DefaultTransport = usageTransport(func(r *http.Request) (*http.Response, error) {
+					if r.Header.Get("OpenAI-Account-ID") != "work" {
+						t.Error("unreadable login must skip direct usage requests")
+					}
+					return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"rate_limit":{"primary_window":{"used_percent":20,"window_minutes":10080}}}`))}, nil
+				})
+				if err := a.refreshAccounts(true); err != nil {
+					t.Fatal(err)
+				}
+				if len(a.accounts) != 2 {
+					t.Fatalf("configured home disappeared: %+v", a.accounts)
+				}
+				usage := a.state.Accounts["main"].Usage
+				if fallbackFails {
+					if !strings.Contains(usage.Error, "read main login:") || !strings.Contains(usage.Error, "fallback unavailable") {
+						t.Fatalf("missing combined login and fallback error: %s", usage.Error)
+					}
+				} else if usage.Error != "" || usage.WeeklyUsedPct == nil || *usage.WeeklyUsedPct != 34 {
+					t.Fatalf("fallback usage = %+v", usage)
+				}
+				visible := false
+				for _, entry := range buildMenuEntries(a.accounts, "") {
+					visible = visible || strings.Contains(entry.Title, "read main login:")
+				}
+				if visible != fallbackFails {
+					t.Fatalf("login error visible = %t, want %t", visible, fallbackFails)
+				}
+			})
+		}
 	}
 }
