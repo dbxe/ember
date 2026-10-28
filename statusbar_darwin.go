@@ -77,6 +77,7 @@ static NSImage *emberStatusImage(void) {
 	[statusItem.button setAccessibilityLabel:title];
 
 	statusMenu = [[NSMenu alloc] init];
+	statusMenu.autoenablesItems = NO;
 	statusMenu.delegate = self;
 	statusItem.menu = statusMenu;
 }

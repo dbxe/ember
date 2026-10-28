@@ -26,13 +26,12 @@ const (
 )
 
 type AccountManager struct {
-	accountsDir string
+	homesPath string
 }
 
 type Account struct {
-	Name string
-	Path string
-	Auth AuthFile
+	Name string `json:"name"`
+	Home string `json:"home"`
 }
 
 type AuthFile struct {
@@ -54,80 +53,87 @@ type UsageSnapshot struct {
 
 func NewAccountManager() *AccountManager {
 	homeDir, _ := os.UserHomeDir()
-	codexDir := filepath.Join(homeDir, ".codex")
-	return &AccountManager{
-		accountsDir: filepath.Join(codexDir, "accounts"),
-	}
+	return &AccountManager{homesPath: filepath.Join(homeDir, ".codex", "ember", "homes.json")}
 }
 
 func (m *AccountManager) ListAccounts() ([]Account, error) {
-	entries, err := os.ReadDir(m.accountsDir)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
-		}
+	data, err := os.ReadFile(m.homesPath)
+	if errors.Is(err, os.ErrNotExist) {
+		data = []byte(`[{"name":"work","home":"~/.codex"}]`)
+	} else if err != nil {
 		return nil, err
 	}
-
-	accounts := make([]Account, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
-		}
-		name := strings.TrimSuffix(entry.Name(), ".json")
-		path := filepath.Join(m.accountsDir, entry.Name())
-		account, err := m.readAccount(name, path)
-		if err != nil {
-			continue
-		}
-		accounts = append(accounts, account)
+	var accounts []Account
+	if err := json.Unmarshal(data, &accounts); err != nil {
+		return nil, fmt.Errorf("homes.json: %w", err)
 	}
-
-	sort.Slice(accounts, func(i, j int) bool {
-		return strings.ToLower(accounts[i].Name) < strings.ToLower(accounts[j].Name)
-	})
+	if accounts == nil {
+		return nil, errors.New("homes.json: expected a list of Codex homes")
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	names := make(map[string]bool, len(accounts))
+	for i := range accounts {
+		account := &accounts[i]
+		if strings.TrimSpace(account.Name) == "" || names[account.Name] {
+			return nil, errors.New("homes.json: each home needs a unique, nonempty name")
+		}
+		names[account.Name] = true
+		if account.Home == "~" {
+			account.Home = homeDir
+		} else if strings.HasPrefix(account.Home, "~/") {
+			account.Home = filepath.Join(homeDir, account.Home[2:])
+		}
+		if !filepath.IsAbs(account.Home) {
+			return nil, fmt.Errorf("homes.json: home for %q must be an absolute path or start with ~/", account.Name)
+		}
+		account.Home = filepath.Clean(account.Home)
+	}
 	return accounts, nil
 }
 
 func (m *AccountManager) FetchUsage(account Account) (UsageSnapshot, error) {
+	data, err := os.ReadFile(filepath.Join(account.Home, "auth.json"))
+	if err != nil {
+		return UsageSnapshot{}, fmt.Errorf("read %s login: %w", account.Name, err)
+	}
+	var auth AuthFile
+	if err := json.Unmarshal(data, &auth); err != nil {
+		return UsageSnapshot{}, fmt.Errorf("read %s login: %w", account.Name, err)
+	}
 	tokens := []struct {
 		label string
 		value string
 	}{
-		{label: "access_token", value: account.Auth.Tokens.AccessToken},
-		{label: "id_token", value: account.Auth.Tokens.IDToken},
+		{label: "access_token", value: auth.Tokens.AccessToken},
+		{label: "id_token", value: auth.Tokens.IDToken},
 	}
 	endpoints := []string{usageEndpointBackend, usageEndpointAPI, usageEndpointWHAM}
-	var lastErr error
 
 	for _, token := range tokens {
 		if token.value == "" {
 			continue
 		}
 		for _, endpoint := range endpoints {
-			usage, err := fetchUsageEndpoint(endpoint, token.value, account.Auth.Tokens.AccountID)
+			usage, err := fetchUsageEndpoint(endpoint, token.value, auth.Tokens.AccountID)
 			if err == nil {
 				usage.Source = endpoint + " via " + token.label
 				return usage, nil
 			}
-			lastErr = err
 		}
 	}
 
-	if usage, err := m.fetchUsageFromServer(account); err == nil {
-		return usage, nil
-	} else {
-		lastErr = err
+	usage, err := m.fetchUsageFromServer(account)
+	if err != nil {
+		return UsageSnapshot{}, fmt.Errorf("weekly Codex usage unavailable: %w", err)
 	}
-
-	if lastErr == nil {
-		lastErr = errors.New("no usable account token")
-	}
-	return UsageSnapshot{}, fmt.Errorf("weekly Codex usage unavailable: %w", lastErr)
+	return usage, nil
 }
 
-// WarmAccount performs exactly one small inference using only this account's
-// credentials. The caller verifies the reset countdown separately.
+// WarmAccount performs exactly one small inference in the configured Codex home.
+// The caller verifies the reset countdown separately.
 func (m *AccountManager) WarmAccount(account Account) error {
 	root, err := os.MkdirTemp("", "ember-warm-*")
 	if err != nil {
@@ -142,7 +148,7 @@ func (m *AccountManager) WarmAccount(account Account) error {
 		"--model", "gpt-6-luna", "-c", `model_reasoning_effort="low"`,
 		"--ephemeral", "--output-last-message", replyPath,
 		"--", "Briefly acknowledge this message. Reply with exactly OK. Do not use tools.")
-	cmd.Env = probeEnvironment(filepath.Dir(account.Path))
+	cmd.Env = probeEnvironment(account.Home)
 	cmd.Dir = root
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -165,8 +171,8 @@ func (m *AccountManager) fetchUsageFromServer(account Account) (UsageSnapshot, e
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, codexCommandPath(), "app-server", "--listen", "stdio://")
-	cmd.Env = probeEnvironment(filepath.Dir(account.Path))
-	cmd.Dir = filepath.Dir(account.Path)
+	cmd.Env = probeEnvironment(account.Home)
+	cmd.Dir = account.Home
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return UsageSnapshot{}, err
@@ -238,7 +244,7 @@ func (m *AccountManager) fetchUsageFromServer(account Account) (UsageSnapshot, e
 }
 
 func probeEnvironment(home string) []string {
-	env := make([]string, 0, len(os.Environ())+2)
+	env := make([]string, 0, len(os.Environ())+1)
 	for _, entry := range os.Environ() {
 		key, _, _ := strings.Cut(entry, "=")
 		switch key {
@@ -248,26 +254,6 @@ func probeEnvironment(home string) []string {
 		env = append(env, entry)
 	}
 	return append(env, "CODEX_HOME="+home)
-}
-
-func (m *AccountManager) readAccount(name, path string) (Account, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return Account{}, err
-	}
-	return parseAccount(name, path, data)
-}
-
-func parseAccount(name, path string, data []byte) (Account, error) {
-	var auth AuthFile
-	if err := json.Unmarshal(data, &auth); err != nil {
-		return Account{}, err
-	}
-
-	if auth.Tokens.AccessToken == "" {
-		return Account{}, errors.New("invalid ChatGPT login credentials")
-	}
-	return Account{Name: name, Path: path, Auth: auth}, nil
 }
 
 func fetchUsageEndpoint(endpoint, token, accountID string) (UsageSnapshot, error) {

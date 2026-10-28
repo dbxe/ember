@@ -96,15 +96,15 @@ func (a *App) Shutdown() {
 }
 
 func (a *App) HandleMenuAction(tag int) {
-	switch {
-	case tag == TagRefresh:
+	switch tag {
+	case TagRefresh:
 		if err := a.refreshAccounts(true); err != nil {
 			a.setLastError(err)
 			fmt.Fprintf(os.Stderr, "refresh failed: %v\n", err)
 		} else {
 			a.setLastError(nil)
 		}
-	case tag == TagQuit:
+	case TagQuit:
 		TerminateApp()
 	}
 
@@ -196,22 +196,14 @@ func (a *App) syncAccounts(fetchUsage, forceUsage bool) error {
 					if err := a.saveState(); err != nil {
 						return err
 					}
-					// A read-only fallback may have rotated this account's credentials.
-					fresh, err := a.manager.readAccount(account.Name, account.Path)
-					if err == nil {
-						err = a.manager.WarmAccount(fresh)
-					}
-					if err != nil {
+					if err := a.manager.WarmAccount(account); err != nil {
 						cache.Warmup.fail(err.Error(), a.now())
 					} else {
 						cache.Warmup.Phase = "verifying"
-						fresh, err = a.manager.readAccount(account.Name, account.Path)
-						if err == nil {
-							if after, fetchErr := a.manager.FetchUsage(fresh); fetchErr == nil {
-								cache.Usage = after
-								cache.LastUsageFetchedAt = a.now()
-								cache.Warmup.observe(after, a.now())
-							}
+						if after, fetchErr := a.manager.FetchUsage(account); fetchErr == nil {
+							cache.Usage = after
+							cache.LastUsageFetchedAt = a.now()
+							cache.Warmup.observe(after, a.now())
 						}
 					}
 				}
